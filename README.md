@@ -14,7 +14,7 @@ Este proyecto tiene como objetivo desarrollar un sistema para la detección de c
 
 Antes de comenzar, asegúrate de tener instalado lo siguiente:
 
-- **Python 3.8 o superior**
+- **Python 3.8 o superior** (recomendado: Python 3.14.2)
 - **Git**
 
 ---
@@ -39,13 +39,13 @@ Crea un entorno virtual para aislar las dependencias del proyecto. Los comandos 
 #### **macOS/Linux**
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate (Utilizarlo cada vez que abras la terminal)
 ```
 
 #### **Windows**
 ```bash
 python -m venv .venv
-.venv\Scripts\activate
+.venv\Scripts\activate (Utilizarlo cada vez que abras la terminal)
 ```
 
 > **Nota:** Asegúrate de que el entorno virtual esté activado antes de continuar. Deberías ver el prefijo `(.venv)` en tu terminal.
