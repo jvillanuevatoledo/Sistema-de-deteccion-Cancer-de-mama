@@ -1,7 +1,7 @@
 import numpy as np
-import nibabel as nib
-import imageio.v3 as iio
 from pathlib import Path
+import io_utils
+
 
 class ImageLoader:
     def __init__(self, base_path):
@@ -20,8 +20,8 @@ class ImageLoader:
         print(f"Cargando {len(nifti_files)} volúmenes...")
         for nii_file in nifti_files:
             try:
-                img = nib.load(nii_file)
-                data = img.get_fdata()
+                data, affine = io_utils.load_nifti_volume(nii_file)
+                p_low, p_high = np.percentile(data, [2, 98])
 
                 image_info = {
                     'data': data,
@@ -29,11 +29,11 @@ class ImageLoader:
                     'filename': nii_file.name,
                     'type': '3D',
                     'colormap': 'gray',
-                    'contrast_limits': [data.min(), data.max()],
-                    'affine': img.affine
+                    'contrast_limits': [float(p_low), float(p_high)],
+                    'affine': affine
                 }
                 loaded_images.append(image_info)
-                print(f"  {nii_file.name}")
+                print(f"  {nii_file.name} — shape={data.shape}")
             except Exception as e:
                 print(f"Error en {nii_file.name}: {e}")
 
@@ -45,7 +45,7 @@ class ImageLoader:
         loaded_images = []
         for png_file in png_files:
             try:
-                data = iio.imread(png_file)
+                data = io_utils.load_2d_image(png_file)
                 image_info = {
                     'data': data,
                     'name': f"2D_{png_file.stem}",
