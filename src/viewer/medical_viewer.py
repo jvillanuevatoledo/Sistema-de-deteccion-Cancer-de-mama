@@ -151,17 +151,21 @@ def start_viewer(patient_id, base_dir="/Volumes/HRAEPY"):
 
         data_to_save = {}
 
+        mask_path = output_dir / f"{source_filename}_mask.nii.gz"
+        pts_path  = output_dir / f"{source_filename}_points.csv"
+        roi_path  = output_dir / f"{source_filename}_rois.json"
+
         if annotator.is_dirty('labels') and annotator.has_segmentation_data():
             data_to_save['mask'] = {
                 'data': annotator.get_segmentation_data().copy(),
                 'affine': affine,
-                'path': output_dir / f"{source_filename}_mask.nii.gz"
+                'path': mask_path
             }
 
         if annotator.is_dirty('points') and annotator.has_points_data():
             data_to_save['points'] = {
                 'data': annotator.get_points_data().copy(),
-                'path': output_dir / f"{source_filename}_points.csv"
+                'path': pts_path
             }
 
         if annotator.is_dirty('shapes') and annotator.has_roi_data():
@@ -169,13 +173,20 @@ def start_viewer(patient_id, base_dir="/Volumes/HRAEPY"):
             data_to_save['rois'] = {
                 'data': [r.copy() for r in rois],
                 'types': list(types),
-                'path': output_dir / f"{source_filename}_rois.json"
+                'path': roi_path
             }
 
         if not data_to_save:
             viewer.status = "Sin datos nuevos que guardar."
             annotator.mark_saved()
             return
+        
+        existing_on_disk = {
+            'mask':   mask_path.name if mask_path.exists() and 'mask'   not in data_to_save else None,
+            'points': pts_path.name  if pts_path.exists()  and 'points' not in data_to_save else None,
+            'rois':   roi_path.name  if roi_path.exists()  and 'rois'   not in data_to_save else None,
+        }
+        existing_on_disk = {k: v for k, v in existing_on_disk.items() if v is not None}
 
         _saving['active'] = True
         viewer.status = f"Guardando anotaciones para {source_filename}..."
@@ -199,6 +210,7 @@ def start_viewer(patient_id, base_dir="/Volumes/HRAEPY"):
                     io_utils.save_rois_json(r['data'], r['types'], r['path'])
                     saved_files['rois'] = r['path'].name
 
+                saved_files.update(existing_on_disk)
                 with _save_lock:
                     manifest = manifest_cache['data']
                     io_utils.update_manifest_entry(

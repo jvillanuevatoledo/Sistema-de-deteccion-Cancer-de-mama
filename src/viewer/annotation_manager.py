@@ -27,7 +27,8 @@ class AnnotationManager:
             return
 
         suffix = filename.replace('.nii.gz', '').replace('.nii', '').replace('.png', '')
-        is_3d = len(reference_shape) >= 3
+        ndim = len(reference_shape)
+        is_3d = ndim >= 3
 
         labels_layer = self.viewer.add_labels(
             np.zeros(reference_shape, dtype=np.uint16),
@@ -37,14 +38,16 @@ class AnnotationManager:
         points_layer = self.viewer.add_points(
             name=f"Points_{suffix}",
             face_color='red',
-            size=10
+            size=10,
+            ndim=ndim
         )
 
         shapes_layer = self.viewer.add_shapes(
             name=f"ROI_{suffix}",
             edge_color='yellow',
             face_color='transparent',
-            edge_width=3
+            edge_width=3,
+            ndim=ndim
         )
 
         self.annotations[filename] = {
