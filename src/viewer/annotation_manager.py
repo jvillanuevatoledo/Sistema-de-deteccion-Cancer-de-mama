@@ -1,7 +1,20 @@
 import numpy as np
+from napari.utils.colormaps import DirectLabelColormap
+from schemas import LABEL_MAP
+
+
+def _build_label_colormap():
+    color_dict = {
+        lv: [c / 255.0 for c in info["color"]]
+        for lv, info in LABEL_MAP.items()
+    }
+    color_dict[None] = [0.5, 0.5, 0.5, 0.3]
+    return DirectLabelColormap(color_dict=color_dict)
+
 
 class AnnotationManager:
     _LAYER_KEYS = ('labels', 'points', 'shapes')
+    _LABEL_COLORMAP = _build_label_colormap()
 
     def __init__(self, viewer):
         self.viewer = viewer
@@ -32,8 +45,10 @@ class AnnotationManager:
 
         labels_layer = self.viewer.add_labels(
             np.zeros(reference_shape, dtype=np.uint16),
-            name=f"Mask_{suffix}"
+            name=f"Mask_{suffix}",
         )
+        labels_layer.colormap = self._LABEL_COLORMAP
+        labels_layer.selected_label = 1
 
         points_layer = self.viewer.add_points(
             name=f"Points_{suffix}",

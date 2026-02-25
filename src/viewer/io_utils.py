@@ -2,8 +2,11 @@ import numpy as np
 import nibabel as nib
 import imageio.v3 as iio
 import json
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+from schemas import PatientManifest, migrate_v1_manifest
 
 def find_patient_path(patient_id, root_dir):
     search_paths = [
@@ -12,10 +15,30 @@ def find_patient_path(patient_id, root_dir):
     ]
     return next((path for path in search_paths if path.exists()), None)
 
+
 def load_nifti_volume(file_path):
     nifti_obj = nib.load(file_path)
-    volume_data = nifti_obj.get_fdata()
+    raw_dtype = nifti_obj.header.get_data_dtype()
+
+    if raw_dtype.names is not None and set(raw_dtype.names) >= {'R', 'G', 'B'}:
+        raw = np.asarray(nifti_obj.dataobj)
+        r = raw['R'].astype(np.float32)
+        g = raw['G'].astype(np.float32)
+        b = raw['B'].astype(np.float32)
+        volume_data = 0.299 * r + 0.587 * g + 0.114 * b
+
+    elif raw_dtype.names is not None:
+        raw = np.asarray(nifti_obj.dataobj)
+        volume_data = raw[raw_dtype.names[0]].astype(np.float32)
+
+    else:
+        try:
+            volume_data = nifti_obj.get_fdata(dtype=np.float32)
+        except Exception:
+            volume_data = np.asarray(nifti_obj.dataobj).astype(np.float32)
+
     return volume_data, nifti_obj.affine
+
 
 
 def load_nifti_mask(file_path):
@@ -65,19 +88,42 @@ def load_rois_json(file_path):
     return shapes, types
 
 
-def save_manifest(manifest_data, output_path):
-    with open(output_path, "w") as f:
-        json.dump(manifest_data, f, indent=4, ensure_ascii=False)
+def save_manifest(manifest, output_path):
+    if isinstance(manifest, PatientManifest):
+        data = json.loads(manifest.model_dump_json())
+    else:
+        data = manifest
+
+    parent = Path(output_path).parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=parent, suffix=".tmp")
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False, default=str)
+        Path(tmp_path).replace(output_path)
+    except BaseException:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
-def load_manifest(manifest_path):
-    if manifest_path.exists():
-        with open(manifest_path, "r") as f:
-            return json.load(f)
-    return {"patient_id": None, "created_at": None, "files": []}
+def load_manifest(manifest_path, patient_id="unknown"):
+    if not Path(manifest_path).exists():
+        return PatientManifest(patient_id=patient_id)
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if data.get("schema_version", "").startswith("2."):
+        return PatientManifest.model_validate(data)
+
+    return migrate_v1_manifest(data, patient_id)
 
 
 def update_manifest_entry(manifest, source_filename, saved_files, patient_id=None):
+    if isinstance(manifest, PatientManifest):
+        manifest.upsert_annotation(source_filename, saved_files)
+        return manifest
+
     now = datetime.now(timezone.utc).isoformat()
 
     if manifest.get('patient_id') is None and patient_id:

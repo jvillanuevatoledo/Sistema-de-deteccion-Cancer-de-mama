@@ -99,6 +99,7 @@ class SmartMedicalConverter:
         nifti_files = [f for f in output_p.glob("*.nii.gz") if not f.name.startswith('.')]
         return nifti_files, result.stderr
 
+    
     def convert_patient(self, patient_folder: Path) -> tuple:
         patient_id = patient_folder.name
         modality = self.detect_modality(patient_folder)
@@ -115,9 +116,9 @@ class SmartMedicalConverter:
             is_compression_error = "JPEG" in error_message or "Unable to decode" in error_message
             
             if is_compression_error:
-                valid_files_to_remove = [f for f in output_folder.glob("*") if not f.name.startswith('.')]
-                for file_path in valid_files_to_remove:
-                    file_path.unlink(missing_ok=True)
+                for file_path in output_folder.iterdir():
+                    if file_path.is_file() and file_path.suffix in ('.gz', '.json', '.nii', '.bval', '.bvec'):
+                        file_path.unlink(missing_ok=True)
                 
                 repaired_dicom_path = self.repair_dicom_compression(patient_folder)
                 nifti_files, error_message = self._run_dcm2niix(repaired_dicom_path, output_folder, patient_id)
@@ -129,6 +130,7 @@ class SmartMedicalConverter:
                 return (False, modality, f"NIfTI error: {error_message[:50]}")
 
         return (False, modality, f"Modality {modality} not supported")
+    
 
     def run(self) -> None:
         patient_folders = self.get_patient_folders()
