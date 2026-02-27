@@ -9,7 +9,7 @@ from typing import Optional
 os.environ.setdefault("QT_API", "pyside6")
 
 from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QFont, QColor, QIcon
+from PySide6.QtGui import QFont, QColor
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
