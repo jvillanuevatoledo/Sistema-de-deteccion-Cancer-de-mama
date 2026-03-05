@@ -1,13 +1,45 @@
 import os
 os.environ["QT_API"] = "pyside6"
 
+import numpy as np
 import napari
-from PySide6.QtCore import QTimer, QObject, QEvent
+from PySide6.QtCore import QThread, QTimer, QObject, QEvent, Signal, Qt
+from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWidgets import QMessageBox
 from image_loader import ImageLoader
 from annotation_manager import AnnotationManager
 from save_service import SaveService, SaveRequest
 import io_utils
+
+import traceback
+import warnings
+warnings.filterwarnings("ignore", message=".*resource_tracker.*leaked semaphore.*")
+
+
+class _SamWorker(QThread):
+    """Worker que ejecuta SAM2 en segundo plano para no bloquear napari."""
+
+    result_ready = Signal(object)   # emite np.ndarray bool 3D
+    error = Signal(str)
+
+    def __init__(self, assistant, volume: np.ndarray, slice_idx: int,
+                 bbox_yx: tuple) -> None:
+        super().__init__()
+        self._assistant = assistant
+        self.volume = volume
+        self.slice_idx = slice_idx
+        self.bbox_yx = bbox_yx
+
+    def run(self) -> None:
+        try:
+            mask = self._assistant.segment_volume(
+                self.volume, self.slice_idx, self.bbox_yx
+            )
+            self.result_ready.emit(mask)
+        except Exception as exc:
+            self.error.emit(str(exc))
+        finally:
+            self.volume = None  # liberar memoria del volumen
 
 
 def _get_active_image_layer(viewer):
@@ -18,7 +50,9 @@ def _get_active_image_layer(viewer):
     )
 
 
-def start_viewer(patient_id, base_dir="/Volumes/HRAEPY"):
+def start_viewer(patient_id, base_dir=None):
+    if base_dir is None:
+        base_dir = os.environ.get("BASE_DIR", "/Volumes/HRAEPY")
     base_path = io_utils.find_patient_path(patient_id, base_dir)
 
     if not base_path:
@@ -82,6 +116,7 @@ def start_viewer(patient_id, base_dir="/Volumes/HRAEPY"):
     print("=" * 40)
     print("  [S] Guardar  |  Cambiar label: +/-")
     print("  Clasificar CASO: Ctrl+1=Benigno | Ctrl+2=Maligno | Ctrl+3=Incierto")
+    print("  [B] SAM2 — dibuja bbox → segmenta tumor en 3D automáticamente")
     print("=" * 40 + "\n")
     viewer.status = "Pinta: 1=BENIGNO(verde) 2=MALIGNO(rojo) | Clasifica caso: Ctrl+1/2/3 | [S] Guardar"
 
@@ -96,8 +131,6 @@ def start_viewer(patient_id, base_dir="/Volumes/HRAEPY"):
         if fn and fn != annotator.active_filename:
             if annotator.is_dirty():
                 old = annotator.active_filename or "?"
-                print(f"\nCambios sin guardar en: {old}")
-                print("    Regresa a esa imagen y presiona [S] para guardar.")
                 viewer.status = f"Sin guardar: {old} — regresa y presiona [S]"
 
             if annotator.active_filename:
@@ -223,19 +256,23 @@ def start_viewer(patient_id, base_dir="/Volumes/HRAEPY"):
 
     class _CloseGuard(QObject):
         def eventFilter(self, obj, event):
-            if event.type() == QEvent.Type.Close and annotator.is_dirty():
-                reply = QMessageBox.question(
-                    obj,
-                    "Cambios sin guardar",
-                    "Hay anotaciones sin guardar que se perderán.\n"
-                    "¿Realmente deseas salir?",
-                    QMessageBox.StandardButton.Yes
-                    | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-                if reply == QMessageBox.StandardButton.No:
-                    event.ignore()
-                    return True
+            if event.type() == QEvent.Type.Close:
+                worker = _sam_state.get('worker')
+                if worker is not None and worker.isRunning():
+                    worker.wait(3000)
+                if annotator.is_dirty():
+                    reply = QMessageBox.question(
+                        obj,
+                        "Cambios sin guardar",
+                        "Hay anotaciones sin guardar que se perderán.\n"
+                        "¿Realmente deseas salir?",
+                        QMessageBox.StandardButton.Yes
+                        | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    )
+                    if reply == QMessageBox.StandardButton.No:
+                        event.ignore()
+                        return True
             return False
 
     _CASE_LABELS = {
@@ -258,11 +295,272 @@ def start_viewer(patient_id, base_dir="/Volumes/HRAEPY"):
                 m.annotations[fn].label = label_cls
                 io_utils.save_manifest(m, manifest_path)
             viewer.status = f"Caso '{fn}' clasificado como: {label_cls.value.upper()}"
-            print(f"[Clasificación] {fn} → {label_cls.value}")
         return _handler
 
     for key, cls in _CASE_LABELS.items():
         viewer.bind_key(key, _make_case_label_handler(cls))
+
+
+    from sam_assistant import SAM2Assistant
+    from napari.utils.colormaps import DirectLabelColormap
+
+    _sam = SAM2Assistant()
+    _sam_state: dict = {
+        'bbox_layer': None,
+        'proposal_layer': None,
+        'worker': None,
+        'transpose_mask': False,  # True si transpusimos (H,W,D)→(D,H,W) para SAM
+    }
+
+    def _sam_remove_layer(key: str) -> None:
+        layer = _sam_state.get(key)
+        if layer is not None:
+            try:
+                viewer.layers.remove(layer)
+            except Exception:
+                pass
+            _sam_state[key] = None
+
+    def _sam_cleanup() -> None:
+        _sam_remove_layer('bbox_layer')
+        _sam_remove_layer('proposal_layer')
+
+    def _extract_bbox(bl) -> tuple | None:
+        """Extrae (r0, c0, r1, c1) del último rectángulo. None si no es válido.
+
+        napari almacena los vértices como (dim0, dim1, ..., dimN) donde:
+          3D (H,W,D): col0=Y(rows), col1=X(cols), col2=Z(slice) ← ÚLTIMO es slider
+          4D (T,H,W,D): col0=T, col1=Y, col2=X, col3=Z
+        Los ejes MOSTRADOS son siempre los penúltimos dos (nd-3 y nd-2).
+        El último eje (nd-1) es el slider/slice actual — NO coordenada espacial.
+        """
+        try:
+            if len(bl.data) == 0:
+                return None
+            shape_data = bl.data[-1]
+            if shape_data.shape[0] < 4:
+                return None
+            nd = shape_data.shape[1]
+            # nd-3 = Y (rows), nd-2 = X (cols), nd-1 = Z slice (ignorar)
+            y_coords = shape_data[:, nd - 3]
+            x_coords = shape_data[:, nd - 2]
+            r0, r1 = int(y_coords.min()), int(y_coords.max())
+            c0, c1 = int(x_coords.min()), int(x_coords.max())
+            return (r0, c0, r1, c1)
+        except Exception:
+            return None
+
+    def _sam_launch_from_bbox() -> None:
+        """Lee el rectángulo de la capa bbox y lanza el worker SAM2."""
+        bl = _sam_state.get('bbox_layer')
+        if bl is None:
+            viewer.status = "Primero presiona [B] y dibuja un rectángulo."
+            return
+
+        bbox = _extract_bbox(bl)
+        if bbox is None:
+            viewer.status = "No hay rectángulo dibujado. Dibuja uno y presiona [Enter]."
+            return
+
+        r0, c0, r1, c1 = bbox
+        if (r1 - r0) < 5 or (c1 - c0) < 5:
+            viewer.status = "Rectángulo demasiado pequeño — dibuja uno más grande."
+            return
+
+        active_layer = _get_active_image_layer(viewer)
+        if active_layer is None:
+            viewer.status = "No hay imagen activa."
+            _sam_cleanup()
+            return
+
+        try:
+            data = active_layer.data
+            ndim = data.ndim
+            step = viewer.dims.current_step
+
+            if ndim == 3:
+                slice_idx = int(step[ndim - 1])
+                volume = np.moveaxis(np.asarray(data), -1, 0)
+                _sam_state['transpose_mask'] = True
+            elif ndim == 4:
+                slice_idx = int(step[ndim - 1])
+                volume = np.moveaxis(np.asarray(data[int(step[0])]), -1, 0)
+                _sam_state['transpose_mask'] = True
+            else:
+                viewer.status = f"Dimensiones {ndim}D no soportadas por SAM."
+                _sam_cleanup()
+                return
+
+            viewer.status = "⏳ SAM2 procesando…"
+
+            worker = _SamWorker(_sam, volume, slice_idx, (r0, c0, r1, c1))
+            worker.result_ready.connect(_on_sam_result)
+            worker.error.connect(_on_sam_error)
+            _sam_state['worker'] = worker
+            worker.start()
+
+        except Exception as exc:
+            print(f"[SAM2] Error: {exc}")
+            viewer.status = f"SAM error: {exc}"
+            _sam_cleanup()
+
+    def _on_sam_result(mask_3d: np.ndarray) -> None:
+        worker = _sam_state.get('worker')
+        if worker is not None:
+            worker.wait(2000)
+            worker.deleteLater()
+        _sam_state['worker'] = None
+        _sam_remove_layer('bbox_layer')
+        _sam_remove_layer('proposal_layer')
+
+        if _sam_state.get('transpose_mask'):
+            mask_3d = np.moveaxis(mask_3d, 0, -1)  # (D,H,W) → (H,W,D)
+            _sam_state['transpose_mask'] = False
+
+        true_count = int(mask_3d.sum())
+        if true_count == 0:
+            viewer.status = "SAM no detectó tumor en esa región. Intenta con otro rectángulo."
+            return
+
+        proposal = viewer.add_labels(
+            mask_3d.astype(np.uint8),
+            name="[SAM] Propuesta",
+            opacity=0.55,
+        )
+        try:
+            proposal.colormap = DirectLabelColormap(
+                color_dict={0: [0, 0, 0, 0], 1: [0.0, 1.0, 1.0, 0.7],
+                            None: [0, 0, 0, 0]}
+            )
+        except Exception:
+            pass
+        _sam_state['proposal_layer'] = proposal
+
+        ann = annotator.get_active_annotations()
+        label_val = 1
+        label_name = "BENIGN"
+        if ann is not None:
+            label_val = ann['labels'].selected_label
+            info = LABEL_MAP.get(label_val)
+            label_name = info['name'].upper() if info else str(label_val)
+
+        viewer.status = (
+            f"SAM listo \u2713  |  Label: {label_val} ({label_name})  |  "
+            f"[Enter] Aceptar  |  [Esc] Descartar  |  [+/-] Cambiar label"
+        )
+
+    def _on_sam_error(msg: str) -> None:
+        worker = _sam_state.get('worker')
+        if worker is not None:
+            worker.wait(2000)
+            worker.deleteLater()
+        _sam_state['worker'] = None
+        _sam_remove_layer('bbox_layer')
+        viewer.status = f"SAM error: {msg}"
+        print(f"[SAM2] Error: {msg}")
+
+    def _sam_accept() -> None:
+        """Acepta la propuesta y la escribe en la capa de labels."""
+        prop = _sam_state.get('proposal_layer')
+        if prop is None:
+            return
+        ann = annotator.get_active_annotations()
+        if ann is None:
+            viewer.status = "No hay capa de anotaci\u00f3n activa."
+            _sam_remove_layer('proposal_layer')
+            return
+
+        try:
+            labels_layer = ann['labels']
+            label_val = labels_layer.selected_label
+
+            mask = np.asarray(prop.data) > 0
+            new_data = np.array(labels_layer.data)
+            new_data[mask] = label_val
+
+            # La propuesta se remueve ANTES de asignar datos para evitar
+            # conflicto en el render loop con ambas capas activas.
+            _sam_state['proposal_layer'] = None
+            try:
+                viewer.layers.remove(prop)
+            except Exception:
+                pass
+            del prop, mask
+
+            labels_layer.data = new_data
+            del new_data
+
+            annotator._dirty[annotator.active_filename]['labels'] = True
+            annotator._has_mask_data[annotator.active_filename] = True
+
+            info = LABEL_MAP.get(label_val)
+            label_name = info['name'].upper() if info else str(label_val)
+            viewer.status = f"\u2713 SAM aceptado \u2014 {label_name} (label {label_val}) | [S] Guardar"
+
+        except Exception as exc:
+            print(f"[SAM2] Error al aceptar propuesta: {exc}")
+            traceback.print_exc()
+            viewer.status = f"Error al aceptar: {exc}"
+            _sam_remove_layer('proposal_layer')
+
+    @viewer.bind_key('b')
+    def start_sam_bbox(viewer_instance) -> None:
+        """[B] Activar modo bbox SAM2."""
+        if _sam_state.get('worker') is not None:
+            viewer.status = "SAM ya está procesando, espera."
+            return
+        if _sam_state.get('proposal_layer') is not None:
+            viewer.status = "Propuesta pendiente: [Enter] aceptar o [Esc] descartar."
+            return
+        _sam_remove_layer('bbox_layer')
+
+        active_layer = _get_active_image_layer(viewer)
+        if active_layer is None:
+            viewer.status = "No hay imagen activa."
+            return
+
+        bbox_layer = viewer.add_shapes(
+            name="[SAM] BBox",
+            edge_color='yellow',
+            face_color=[1.0, 1.0, 0.0, 0.08],
+            edge_width=2,
+            ndim=active_layer.data.ndim,
+        )
+        bbox_layer.mode = 'add_rectangle'
+        _sam_state['bbox_layer'] = bbox_layer
+        viewer.layers.selection.active = bbox_layer
+        viewer.status = (
+            "[SAM] Dibuja un rectángulo alrededor del tumor → "
+            "luego presiona [Enter] para segmentar"
+        )
+
+    _qt_win = viewer.window._qt_window
+
+    def _on_enter_shortcut() -> None:
+        if _sam_state.get('worker') is not None:
+            viewer.status = "SAM procesando, espera\u2026"
+            return
+        if _sam_state.get('proposal_layer') is not None:
+            _sam_accept()
+        elif _sam_state.get('bbox_layer') is not None:
+            _sam_launch_from_bbox()
+
+    def _on_escape_shortcut() -> None:
+        if (
+            _sam_state.get('proposal_layer') is not None
+            or _sam_state.get('bbox_layer') is not None
+        ):
+            _sam_cleanup()
+            viewer.status = "SAM descartado."
+
+    _sc_enter = QShortcut(QKeySequence(Qt.Key.Key_Return), _qt_win)
+    _sc_enter.setContext(Qt.ShortcutContext.WindowShortcut)
+    _sc_enter.activated.connect(_on_enter_shortcut)
+
+    _sc_escape = QShortcut(QKeySequence(Qt.Key.Key_Escape), _qt_win)
+    _sc_escape.setContext(Qt.ShortcutContext.WindowShortcut)
+    _sc_escape.activated.connect(_on_escape_shortcut)
+
 
     try:
         _guard = _CloseGuard()
@@ -293,7 +591,6 @@ def _load_existing_annotations(annotator, filename, output_dir):
         try:
             mask_data, _ = io_utils.load_nifti_mask(mask_path)
             annotator.load_existing_mask(filename, mask_data)
-            print(f"Máscara cargada: {mask_path.name}")
         except Exception as e:
             print(f"Error cargando máscara: {e}")
 
@@ -304,7 +601,6 @@ def _load_existing_annotations(annotator, filename, output_dir):
             if pts_data.ndim == 1:
                 pts_data = pts_data.reshape(1, -1)
             annotator.load_existing_points(filename, pts_data)
-            print(f"Puntos cargados: {pts_path.name}")
         except Exception as e:
             print(f"Error cargando puntos: {e}")
 
@@ -313,17 +609,22 @@ def _load_existing_annotations(annotator, filename, output_dir):
         try:
             shapes, types = io_utils.load_rois_json(roi_path)
             annotator.load_existing_rois(filename, shapes, types)
-            print(f"ROIs cargados: {roi_path.name}")
         except Exception as e:
             print(f"Error cargando ROIs: {e}")
 
 
 if __name__ == "__main__":
-    from patient_browser import select_patient
+    _env_pid = os.environ.get("_LAUNCH_PATIENT_ID")
+    _env_base = os.environ.get("_LAUNCH_BASE_DIR")
 
-    choice = select_patient()
-    if choice:
-        patient_id, base_dir = choice
-        start_viewer(patient_id, base_dir=base_dir)
+    if _env_pid and _env_base:
+        start_viewer(_env_pid, base_dir=_env_base)
     else:
-        print("No se seleccionó ningún paciente.")
+        from patient_browser import select_patient
+
+        choice = select_patient()
+        if choice:
+            patient_id, base_dir = choice
+            start_viewer(patient_id, base_dir=base_dir)
+        else:
+            print("No se seleccionó ningún paciente.")

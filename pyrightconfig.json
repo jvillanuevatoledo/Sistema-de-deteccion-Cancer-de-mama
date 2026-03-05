@@ -1,0 +1,10 @@
+{
+  "include": ["src"],
+  "extraPaths": [
+    "src/viewer",
+    "src/preprocessing",
+    "src/pipeline"
+  ],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "off"
+}

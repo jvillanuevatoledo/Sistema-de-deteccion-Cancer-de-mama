@@ -27,7 +27,31 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-DEFAULT_BASE_DIR = "/Volumes/HRAEPY"
+def _default_base_dir() -> str:
+    env = os.environ.get("BASE_DIR")
+    if env:
+        return env
+    import platform
+    system = platform.system()
+    if system == "Darwin":
+        return "/Volumes/HRAEPY"
+    elif system == "Windows":
+        for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+            candidate = Path(f"{letter}:/HRAEPY")
+            if candidate.exists():
+                return str(candidate)
+        return str(Path.home() / "HRAEPY")
+    else: 
+        for candidate in (
+            Path("/mnt/HRAEPY"),
+            Path("/media") / os.getenv("USER", "user") / "HRAEPY",
+        ):
+            if candidate.exists():
+                return str(candidate)
+        return str(Path.home() / "HRAEPY")
+
+
+DEFAULT_BASE_DIR = _default_base_dir()
 CATEGORY_DIRS = ("MAMA", "PROSTATA")
 PROCESSED_SUBDIR = "PROCESSED_DATA"
 ANNOTATIONS_SUBDIR = "ANNOTATIONS"

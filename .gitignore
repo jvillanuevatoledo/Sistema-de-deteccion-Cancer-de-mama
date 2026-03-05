@@ -11,3 +11,8 @@ data/
 *.dcm
 
 .env
+
+# --- Modelos de IA (checkpoints grandes) ---
+models/*.pt
+models/*.pth
+models/*.ckpt
