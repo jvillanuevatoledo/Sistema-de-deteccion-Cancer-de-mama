@@ -17,8 +17,6 @@ warnings.filterwarnings("ignore", message=".*resource_tracker.*leaked semaphore.
 
 
 class _SamWorker(QThread):
-    """Worker que ejecuta SAM2 en segundo plano para no bloquear napari."""
-
     result_ready = Signal(object)   # emite np.ndarray bool 3D
     error = Signal(str)
 
@@ -174,8 +172,7 @@ def start_viewer(patient_id, base_dir=None):
         if isinstance(layer, napari.layers.Image):
             layer.events.visible.connect(on_visibility_change)
 
-    @viewer.bind_key('s')
-    def save_session(viewer_instance):
+    def _save_session():
         active_layer = _get_active_image_layer(viewer)
 
         if not active_layer:
@@ -478,8 +475,6 @@ def start_viewer(patient_id, base_dir=None):
             new_data = np.array(labels_layer.data)
             new_data[mask] = label_val
 
-            # La propuesta se remueve ANTES de asignar datos para evitar
-            # conflicto en el render loop con ambas capas activas.
             _sam_state['proposal_layer'] = None
             try:
                 viewer.layers.remove(prop)
@@ -553,6 +548,28 @@ def start_viewer(patient_id, base_dir=None):
             _sam_cleanup()
             viewer.status = "SAM descartado."
 
+    _valid_labels = [k for k in LABEL_MAP if k != 0]
+
+    def _cycle_label(delta: int) -> None:
+        ann = annotator.get_active_annotations()
+        if ann is None:
+            return
+        labels_layer = ann['labels']
+        current = labels_layer.selected_label
+        if current not in _valid_labels:
+            next_val = _valid_labels[0]
+        else:
+            idx = _valid_labels.index(current)
+            next_val = _valid_labels[(idx + delta) % len(_valid_labels)]
+        labels_layer.selected_label = next_val
+        info = LABEL_MAP.get(next_val)
+        label_name = info['name'].upper() if info else str(next_val)
+        viewer.status = f"Label activo: {next_val} ({label_name}) | [S] Guardar"
+
+    _sc_save = QShortcut(QKeySequence(Qt.Key.Key_S), _qt_win)
+    _sc_save.setContext(Qt.ShortcutContext.WindowShortcut)
+    _sc_save.activated.connect(_save_session)
+
     _sc_enter = QShortcut(QKeySequence(Qt.Key.Key_Return), _qt_win)
     _sc_enter.setContext(Qt.ShortcutContext.WindowShortcut)
     _sc_enter.activated.connect(_on_enter_shortcut)
@@ -561,6 +578,18 @@ def start_viewer(patient_id, base_dir=None):
     _sc_escape.setContext(Qt.ShortcutContext.WindowShortcut)
     _sc_escape.activated.connect(_on_escape_shortcut)
 
+    # Key_Plus = Shift+= en teclado estándar; Key_Equal como alternativa sin Shift
+    _sc_plus = QShortcut(QKeySequence(Qt.Key.Key_Plus), _qt_win)
+    _sc_plus.setContext(Qt.ShortcutContext.WindowShortcut)
+    _sc_plus.activated.connect(lambda: _cycle_label(+1))
+
+    _sc_equal = QShortcut(QKeySequence(Qt.Key.Key_Equal), _qt_win)
+    _sc_equal.setContext(Qt.ShortcutContext.WindowShortcut)
+    _sc_equal.activated.connect(lambda: _cycle_label(+1))
+
+    _sc_minus = QShortcut(QKeySequence(Qt.Key.Key_Minus), _qt_win)
+    _sc_minus.setContext(Qt.ShortcutContext.WindowShortcut)
+    _sc_minus.activated.connect(lambda: _cycle_label(-1))
 
     try:
         _guard = _CloseGuard()
@@ -572,7 +601,6 @@ def start_viewer(patient_id, base_dir=None):
     saver.stop()
     debounce_timer.stop()
 
-
 def _resolve_path(output_dir, filename, suffix):
     """Devuelve la ruta correcta del artefacto, con compatibilidad hacia atrás."""
     stem = filename.replace('.nii.gz', '').replace('.nii', '')
@@ -583,7 +611,6 @@ def _resolve_path(output_dir, filename, suffix):
     if old_path.exists():
         return old_path
     return new_path
-
 
 def _load_existing_annotations(annotator, filename, output_dir):
     mask_path = _resolve_path(output_dir, filename, "_mask.nii.gz")
@@ -611,7 +638,6 @@ def _load_existing_annotations(annotator, filename, output_dir):
             annotator.load_existing_rois(filename, shapes, types)
         except Exception as e:
             print(f"Error cargando ROIs: {e}")
-
 
 if __name__ == "__main__":
     _env_pid = os.environ.get("_LAUNCH_PATIENT_ID")
