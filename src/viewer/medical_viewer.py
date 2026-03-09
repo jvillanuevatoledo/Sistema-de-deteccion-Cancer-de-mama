@@ -256,7 +256,7 @@ def start_viewer(patient_id, base_dir=None):
             if event.type() == QEvent.Type.Close:
                 worker = _sam_state.get('worker')
                 if worker is not None and worker.isRunning():
-                    worker.wait(3000)
+                    worker.quit()
                 if annotator.is_dirty():
                     reply = QMessageBox.question(
                         obj,
@@ -404,7 +404,6 @@ def start_viewer(patient_id, base_dir=None):
     def _on_sam_result(mask_3d: np.ndarray) -> None:
         worker = _sam_state.get('worker')
         if worker is not None:
-            worker.wait(2000)
             worker.deleteLater()
         _sam_state['worker'] = None
         _sam_remove_layer('bbox_layer')
@@ -449,7 +448,6 @@ def start_viewer(patient_id, base_dir=None):
     def _on_sam_error(msg: str) -> None:
         worker = _sam_state.get('worker')
         if worker is not None:
-            worker.wait(2000)
             worker.deleteLater()
         _sam_state['worker'] = None
         _sam_remove_layer('bbox_layer')
@@ -457,13 +455,12 @@ def start_viewer(patient_id, base_dir=None):
         print(f"[SAM2] Error: {msg}")
 
     def _sam_accept() -> None:
-        """Acepta la propuesta y la escribe en la capa de labels."""
         prop = _sam_state.get('proposal_layer')
         if prop is None:
             return
         ann = annotator.get_active_annotations()
         if ann is None:
-            viewer.status = "No hay capa de anotaci\u00f3n activa."
+            viewer.status = "No hay capa de anotación activa."
             _sam_remove_layer('proposal_layer')
             return
 
@@ -471,8 +468,22 @@ def start_viewer(patient_id, base_dir=None):
             labels_layer = ann['labels']
             label_val = labels_layer.selected_label
 
-            mask = np.asarray(prop.data) > 0
-            new_data = np.array(labels_layer.data)
+            prop_data = np.asarray(prop.data)
+            labels_data = np.asarray(labels_layer.data)
+
+            if prop_data.shape != labels_data.shape:
+                print(
+                    f"[SAM2] Shape mismatch: propuesta={prop_data.shape} "
+                    f"vs labels={labels_data.shape} — abortando aceptación."
+                )
+                viewer.status = (
+                    f"Error: shape de propuesta {prop_data.shape} no coincide "
+                    f"con labels {labels_data.shape}. Descarta con [Esc]."
+                )
+                return
+
+            mask = prop_data > 0
+            new_data = labels_data.copy()
             new_data[mask] = label_val
 
             _sam_state['proposal_layer'] = None
@@ -490,7 +501,7 @@ def start_viewer(patient_id, base_dir=None):
 
             info = LABEL_MAP.get(label_val)
             label_name = info['name'].upper() if info else str(label_val)
-            viewer.status = f"\u2713 SAM aceptado \u2014 {label_name} (label {label_val}) | [S] Guardar"
+            viewer.status = f"✓ SAM aceptado — {label_name} (label {label_val}) | [S] Guardar"
 
         except Exception as exc:
             print(f"[SAM2] Error al aceptar propuesta: {exc}")
